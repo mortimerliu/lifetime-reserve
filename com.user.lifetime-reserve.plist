@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.lifetime-reserve</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/hongruliu/Documents/src/lifetime-reserve/.venv/bin/python</string>
+        <string>/Users/hongruliu/Documents/src/lifetime-reserve/reserve.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/hongruliu/Documents/src/lifetime-reserve</string>
+
+    <!-- Run daily at 9:00 AM -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/hongruliu/Documents/src/lifetime-reserve/reserve.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/hongruliu/Documents/src/lifetime-reserve/reserve.log</string>
+</dict>
+</plist>
