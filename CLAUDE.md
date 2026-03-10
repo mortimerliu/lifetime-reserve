@@ -45,9 +45,13 @@ Every API request requires the `ocp-apim-subscription-key` header (hardcoded) pl
 | `retry_count` | Number of attempts for day 8 |
 | `retry_delay_seconds` | Wait between day-8 retries |
 
-## Scheduled job (macOS launchd)
+## Scheduling options
 
-Runs daily at 9 AM via `~/Library/LaunchAgents/com.user.lifetime-reserve.plist`. Output goes to `reserve.log`.
+GitHub Actions cron has unpredictable queue delays (minutes) and is **not suitable** for this time-critical task. Use one of the options below instead.
+
+### Option 1: macOS launchd (current) — requires MacBook on and awake at 9 AM
+
+Plist installed at `~/Library/LaunchAgents/com.user.lifetime-reserve.plist`. Output goes to `reserve.log`.
 
 ```bash
 # Install / reload after editing the plist
@@ -62,3 +66,39 @@ tail -f reserve.log
 ```
 
 The plist points directly to `.venv/bin/python` — no activation needed.
+
+### Option 2: VPS with cron (~$4/month, most reliable)
+
+Any cheap VPS (Hetzner CX22, DigitalOcean Droplet). Cron fires within seconds of schedule.
+
+```bash
+sudo timedatectl set-timezone America/New_York
+sudo apt install python3 python3-pip git -y
+git clone https://github.com/mortimerliu/lifetime-reserve.git
+cd lifetime-reserve && pip3 install requests
+nano config.json   # paste your config
+
+crontab -e
+# Add:
+0 9 * * * cd /root/lifetime-reserve && python3 reserve.py --auto >> reserve.log 2>&1
+```
+
+System timezone handles DST automatically.
+
+### Option 3: GitHub Actions (manual trigger only)
+
+Schedule is disabled in `.github/workflows/reserve.yml` due to queue delays. The workflow still exists for **manual runs** via the GitHub UI or:
+
+```bash
+gh workflow run reserve.yml
+gh run list --limit 1   # check status
+```
+
+To re-enable the schedule, restore the `schedule:` block in the workflow file with:
+```yaml
+  schedule:
+    - cron: '0 13 * * *'  # 9:00 AM EDT (summer)
+    - cron: '0 14 * * *'  # 9:00 AM EST (winter)
+```
+
+The `CONFIG_JSON` secret is already set in the repo — it contains the full `config.json` contents.
