@@ -6,18 +6,21 @@ Modes:
   Interactive (default): choose date, time, and court interactively
   Auto:                  book best slot automatically (for scheduled runs)
   Dry-run:               show available slots without booking
+  Slot:                  book a specific date/time directly (no prompts)
 
 Usage:
-    .venv/bin/python reserve.py              # interactive
-    .venv/bin/python reserve.py --auto       # auto-book from preferred_times config
-    .venv/bin/python reserve.py --dry-run    # show slots only
+    .venv/bin/python reserve.py                              # interactive
+    .venv/bin/python reserve.py --auto                       # auto-book from preferred_times config
+    .venv/bin/python reserve.py --dry-run                    # show slots only
+    .venv/bin/python reserve.py --slot "2026-03-16 04:30"   # book specific slot (24h)
 """
 
+import argparse
 import json
 import logging
 import sys
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import requests
 
@@ -34,10 +37,14 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+# ── Configuration ──────────────────────────────────────────────────────────────
+
 def load_config():
     with open(CONFIG_FILE) as f:
         return json.load(f)
 
+
+# ── HTTP session ───────────────────────────────────────────────────────────────
 
 def make_session():
     s = requests.Session()
@@ -48,6 +55,8 @@ def make_session():
     })
     return s
 
+
+# ── API calls ──────────────────────────────────────────────────────────────────
 
 def login(session, username, password):
     resp = session.post(
@@ -105,9 +114,41 @@ def get_reserved_dates(session, token, sso_id, member_ids, start_date, end_date)
     for item in resp.json().get("results", []):
         start = item.get("start", "")
         if start:
-            reserved.add(start[:10])  # YYYY-MM-DD
+            reserved.add(start[:10])
     return reserved
 
+
+def book_court(session, token, sso_id, resource_id, start, duration):
+    """Create a booking and immediately complete it (accept waiver)."""
+    resp = session.post(
+        f"{API_BASE}/sys/registrations/V3/ux/resource",
+        json={
+            "resourceId": resource_id,
+            "start": start,
+            "service": None,
+            "duration": str(duration),
+        },
+        headers={**auth_headers(token, sso_id), "content-type": "application/json"},
+    )
+    resp.raise_for_status()
+    booking = resp.json()
+
+    # Complete the booking (accept waiver) — moves from pending → completed
+    reg_id = booking.get("regId")
+    agreement_id = booking.get("agreement", {}).get("agreementId")
+    if reg_id and agreement_id and not booking.get("registrationType", {}).get("skipConfirmation", True):
+        complete_resp = session.put(
+            f"{API_BASE}/sys/registrations/V3/ux/resource/{reg_id}/complete",
+            json={"acceptedDocuments": [int(agreement_id)]},
+            headers={**auth_headers(token, sso_id), "content-type": "application/json"},
+        )
+        complete_resp.raise_for_status()
+        booking["regStatus"] = "completed"
+
+    return booking
+
+
+# ── Slot utilities ─────────────────────────────────────────────────────────────
 
 def collect_slots(search_result):
     slots = []
@@ -118,28 +159,38 @@ def collect_slots(search_result):
     return slots
 
 
-def book_court(session, token, sso_id, resource_id, start, duration):
-    resp = session.post(
-        f"{API_BASE}/sys/registrations/V3/ux/resource",
-        json={
-            "resourceId": resource_id,
-            "start": start,
-            "service": None,
-            "duration": str(duration),
-        },
-        headers={
-            **auth_headers(token, sso_id),
-            "content-type": "application/json",
-        },
-    )
-    resp.raise_for_status()
-    return resp.json()
+def to_api_time(hhmm_24h):
+    """Convert '04:30' (24h) to '4:30 AM' (API time format)."""
+    return datetime.strptime(hhmm_24h, "%H:%M").strftime("%-I:%M %p")
 
 
-# ── Interactive helpers ────────────────────────────────────────────────────────
+def auto_pick(slots, preferred_times, preferred_courts):
+    """Pick best slot by preferred time then preferred court. Returns None if no match."""
+    def court_rank(slot):
+        name = slot.get("resourceName", "")
+        try:
+            return preferred_courts.index(name)
+        except ValueError:
+            return len(preferred_courts)
+
+    for pref_time in preferred_times:
+        candidates = [s for s in slots if s["time"] == pref_time]
+        if candidates:
+            candidates.sort(key=court_rank)
+            return candidates[0]
+
+    log.warning("No slots available at preferred times — skipping booking")
+    return None
+
+
+def pick_by_time(slots, api_time):
+    """Return first available slot matching api_time (e.g. '4:30 AM')."""
+    return next((s for s in slots if s["time"] == api_time), None)
+
+
+# ── Interactive prompts ────────────────────────────────────────────────────────
 
 def prompt_date(days_ahead):
-    """Let user pick a date offset (default = days_ahead from config)."""
     print("\nWhich date would you like to book?")
     today = date.today()
     options = [today + timedelta(days=i) for i in range(1, 15)]
@@ -158,14 +209,11 @@ def prompt_date(days_ahead):
 
 
 def prompt_slot(slots):
-    """Let user pick a time + court from available slots."""
     if not slots:
         return None
-
     print("\nAvailable slots:")
     for i, s in enumerate(slots, 1):
         print(f"  {i}) {s['time']:>10}  {s['resourceName']}")
-
     while True:
         raw = input("Choose a slot (number): ").strip()
         if raw.isdigit() and 1 <= int(raw) <= len(slots):
@@ -173,72 +221,78 @@ def prompt_slot(slots):
         print("  Invalid — enter a number from the list.")
 
 
-def auto_pick(slots, preferred_times, preferred_courts):
-    """Pick best slot: preferred time first, then preferred court. Returns None if no preferred time matches."""
-    def court_rank(slot):
-        name = slot.get("resourceName", "")
-        try:
-            return preferred_courts.index(name)
-        except ValueError:
-            return len(preferred_courts)  # unknown courts sort last
+# ── Mode handlers ──────────────────────────────────────────────────────────────
 
-    for pref_time in preferred_times:
-        candidates = [s for s in slots if s["time"] == pref_time]
-        if candidates:
-            candidates.sort(key=court_rank)
-            return candidates[0]
-
-    log.warning("No slots available at preferred times — skipping booking")
-    return None
-
-
-# ── Main ───────────────────────────────────────────────────────────────────────
-
-def main():
-    dry_run = "--dry-run" in sys.argv
-    auto = "--auto" in sys.argv
-    interactive = not auto and not dry_run
-
-    config = load_config()
-    session = make_session()
-    token, sso_id = login(session, config["username"], config["password"])
-
-    preferred_times = config.get("preferred_times", [])
-    preferred_courts = config.get("preferred_courts", [])
+def run_interactive(session, token, sso_id, config):
     club_id = config.get("club_id", "36")
     sport = config.get("sport", "Pickleball: Indoor")
     duration = config.get("duration", 60)
     days_ahead = config.get("days_ahead", 8)
 
-    # ── Interactive mode: user picks date and slot manually ───────────────────
-    if interactive:
-        target_date = prompt_date(days_ahead)
-        print(f"\nSearching courts for {target_date.strftime('%A %Y-%m-%d')} ...")
-        result = search_courts(session, token, sso_id, club_id, sport, target_date, duration)
-        slots = collect_slots(result)
-        if not slots:
-            print(f"No courts available for {target_date}.")
-            sys.exit(0)
-        slot = prompt_slot(slots)
-        if slot is None:
-            print("No slot selected.")
-            sys.exit(0)
-        print(f"\nSelected: {slot['time']} — {slot['resourceName']}")
-        confirm = input("Confirm booking? [y/N] ").strip().lower()
-        if confirm != "y":
-            print("Cancelled.")
-            return
-        print("Booking ...")
-        booking = book_court(session, token, sso_id, slot["resourceId"], slot["start"], duration)
-        print(f"Booking confirmed: {booking}")
+    target_date = prompt_date(days_ahead)
+    print(f"\nSearching courts for {target_date.strftime('%A %Y-%m-%d')} ...")
+    result = search_courts(session, token, sso_id, club_id, sport, target_date, duration)
+    slots = collect_slots(result)
+    if not slots:
+        print(f"No courts available for {target_date}.")
+        sys.exit(0)
+
+    slot = prompt_slot(slots)
+    if slot is None:
+        print("No slot selected.")
+        sys.exit(0)
+
+    print(f"\nSelected: {slot['time']} — {slot['resourceName']}")
+    if input("Confirm booking? [y/N] ").strip().lower() != "y":
+        print("Cancelled.")
         return
 
-    # ── Auto / dry-run mode: try day 8 first, then scan days 1–7 ─────────────
-    today = date.today()
+    print("Booking ...")
+    booking = book_court(session, token, sso_id, slot["resourceId"], slot["start"], duration)
+    print(f"Confirmed: regId={booking['regId']}, status={booking['regStatus']}, location={booking.get('location', '')}")
+
+
+def run_slot(session, token, sso_id, config, slot_datetime_str):
+    """Book a specific date/time directly. Format: 'YYYY-MM-DD HH:MM' (24h)."""
+    try:
+        dt = datetime.strptime(slot_datetime_str, "%Y-%m-%d %H:%M")
+    except ValueError:
+        log.error("Invalid --slot format. Use: YYYY-MM-DD HH:MM (e.g. '2026-03-16 04:30')")
+        sys.exit(1)
+
+    target_date = dt.date()
+    api_time = to_api_time(dt.strftime("%H:%M"))
+    club_id = config.get("club_id", "36")
+    sport = config.get("sport", "Pickleball: Indoor")
+    duration = config.get("duration", 60)
+
+    print(f"\nSearching courts for {target_date.strftime('%A %Y-%m-%d')} at {api_time} ...")
+    result = search_courts(session, token, sso_id, club_id, sport, target_date, duration)
+    slots = collect_slots(result)
+
+    slot = pick_by_time(slots, api_time)
+    if slot is None:
+        available = ", ".join(s["time"] for s in slots) if slots else "none"
+        log.error("No slot available at %s. Available: %s", api_time, available)
+        sys.exit(1)
+
+    print(f"Booking: {slot['time']} {slot['resourceName']} ...")
+    booking = book_court(session, token, sso_id, slot["resourceId"], slot["start"], duration)
+    print(f"Confirmed: regId={booking['regId']}, status={booking['regStatus']}, location={booking.get('location', '')}")
+
+
+def run_auto(session, token, sso_id, config):
+    club_id = config.get("club_id", "36")
+    sport = config.get("sport", "Pickleball: Indoor")
+    duration = config.get("duration", 60)
+    days_ahead = config.get("days_ahead", 8)
+    preferred_times = config.get("preferred_times", [])
+    preferred_courts = config.get("preferred_courts", [])
     retry_count = config.get("retry_count", 3)
     retry_delay = config.get("retry_delay_seconds", 10)
 
-    # Fetch existing reservations once (days 1–8)
+    today = date.today()
+
     member_ids = config.get("member_ids", [])
     if member_ids:
         reserved_dates = get_reserved_dates(
@@ -252,7 +306,6 @@ def main():
         log.warning("member_ids not in config — skipping reservation check")
 
     def try_date(target_date):
-        """Search and (dry-run or) book a slot on target_date. Returns True if booked/would-book."""
         date_str = target_date.strftime("%Y-%m-%d")
         if date_str in reserved_dates:
             log.info("Skipping %s — already have a reservation", date_str)
@@ -266,20 +319,16 @@ def main():
             log.info("No courts available on %s", date_str)
             return False
 
-        print(f"  Available: " + ", ".join(f"{s['time']} {s['resourceName']}" for s in slots))
+        print("  Available: " + ", ".join(f"{s['time']} {s['resourceName']}" for s in slots))
 
         slot = auto_pick(slots, preferred_times, preferred_courts)
         if slot is None:
             log.info("No preferred slot on %s", date_str)
             return False
 
-        if dry_run:
-            print(f"  Would book: {slot['time']} {slot['resourceName']} (dry run — skipping)")
-            return True
-
         print(f"  Booking: {slot['time']} {slot['resourceName']} ...")
         booking = book_court(session, token, sso_id, slot["resourceId"], slot["start"], duration)
-        print(f"  Confirmed: {booking}")
+        print(f"  Confirmed: regId={booking['regId']}, status={booking['regStatus']}, location={booking.get('location', '')}")
         return True
 
     # Priority 1: day 8 — retry up to retry_count times
@@ -302,6 +351,82 @@ def main():
             return
 
     print("\nNo preferred slots found on any day (1–8).")
+
+
+def run_dry_run(session, token, sso_id, config):
+    club_id = config.get("club_id", "36")
+    sport = config.get("sport", "Pickleball: Indoor")
+    duration = config.get("duration", 60)
+    days_ahead = config.get("days_ahead", 8)
+    preferred_times = config.get("preferred_times", [])
+    preferred_courts = config.get("preferred_courts", [])
+
+    today = date.today()
+
+    member_ids = config.get("member_ids", [])
+    if member_ids:
+        reserved_dates = get_reserved_dates(
+            session, token, sso_id, member_ids,
+            today + timedelta(days=1),
+            today + timedelta(days=days_ahead),
+        )
+        log.info("Already reserved dates: %s", sorted(reserved_dates) or "none")
+    else:
+        reserved_dates = set()
+
+    for i in range(1, days_ahead + 1):
+        target_date = today + timedelta(days=i)
+        date_str = target_date.strftime("%Y-%m-%d")
+
+        if date_str in reserved_dates:
+            print(f"\n{target_date.strftime('%A %Y-%m-%d')}: already reserved")
+            continue
+
+        result = search_courts(session, token, sso_id, club_id, sport, target_date, duration)
+        slots = collect_slots(result)
+
+        if not slots:
+            print(f"\n{target_date.strftime('%A %Y-%m-%d')}: no slots available")
+            continue
+
+        slot = auto_pick(slots, preferred_times, preferred_courts)
+        all_times = ", ".join(f"{s['time']} {s['resourceName']}" for s in slots)
+        if slot:
+            print(f"\n{target_date.strftime('%A %Y-%m-%d')}: would book {slot['time']} {slot['resourceName']}")
+            print(f"  All available: {all_times}")
+        else:
+            print(f"\n{target_date.strftime('%A %Y-%m-%d')}: no preferred time available")
+            print(f"  All available: {all_times}")
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Lifetime Fitness Pickleball Court Reservation")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--auto", action="store_true",
+                       help="Auto-book best available slot from preferred_times config")
+    group.add_argument("--dry-run", action="store_true",
+                       help="Show available slots without booking")
+    group.add_argument("--slot", metavar="DATETIME",
+                       help="Book a specific slot: 'YYYY-MM-DD HH:MM' (24h, e.g. '2026-03-16 04:30')")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    config = load_config()
+    session = make_session()
+    token, sso_id = login(session, config["username"], config["password"])
+
+    if args.slot:
+        run_slot(session, token, sso_id, config, args.slot)
+    elif args.auto:
+        run_auto(session, token, sso_id, config)
+    elif args.dry_run:
+        run_dry_run(session, token, sso_id, config)
+    else:
+        run_interactive(session, token, sso_id, config)
 
 
 if __name__ == "__main__":

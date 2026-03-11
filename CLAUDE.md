@@ -5,24 +5,28 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Running the script
 
 ```bash
-.venv/bin/python reserve.py              # interactive: pick date, time, court
-.venv/bin/python reserve.py --auto       # auto-book (used by scheduled job)
-.venv/bin/python reserve.py --dry-run    # show available slots, no booking
+.venv/bin/python reserve.py                            # interactive: pick date, time, court
+.venv/bin/python reserve.py --auto                     # auto-book (used by scheduled job)
+.venv/bin/python reserve.py --dry-run                  # show available slots, no booking
+.venv/bin/python reserve.py --slot "2026-03-16 04:30"  # book a specific slot directly (24h)
 ```
 
 ## Architecture
 
 Single-file script (`reserve.py`) with a flat function structure. All configuration is read from `config.json` at startup.
 
-**API layer** — three Lifetime Fitness endpoints, all under `https://api.lifetimefitness.com`:
+**API layer** — endpoints under `https://api.lifetimefitness.com`:
 - `POST /auth/v2/login` → returns `token` (JWE, used as `x-ltf-jwe`) and `ssoId` (used as `x-ltf-ssoid`)
 - `GET /ux/web-schedules/v2/resources/booking/search` → available court slots for a date
-- `POST /sys/registrations/V3/ux/resource` → creates a booking
+- `POST /sys/registrations/V3/ux/resource` → creates a booking (`regStatus: pending`)
+- `PUT /sys/registrations/V3/ux/resource/{regId}/complete` → accepts waiver, moves booking to `completed` (required — pending bookings don't appear in the reservations list)
 - `GET /ux/web-schedules/v3/reservations` → existing reservations (to skip already-booked dates)
 
 Every API request requires the `ocp-apim-subscription-key` header (hardcoded) plus the two auth headers from login.
 
-**Auto/dry-run booking logic** (`main()`):
+**Code structure** — four mode handler functions: `run_interactive`, `run_slot`, `run_auto`, `run_dry_run`. Shared helpers: `book_court` (create + complete), `collect_slots`, `auto_pick`, `pick_by_time`, `to_api_time`.
+
+**Auto booking logic** (`run_auto()`):
 1. Fetch existing reservations for days 1–8 once upfront
 2. Retry day 8 up to `retry_count` times with `retry_delay_seconds` between attempts (handles slots not yet released at exactly 9 AM)
 3. If day 8 fails all retries, scan days 1–7 once in order, skipping days with existing reservations
