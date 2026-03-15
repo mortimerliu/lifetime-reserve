@@ -16,9 +16,10 @@ Copy `config.json` and fill in your credentials (see [Configuration](#configurat
 ## Usage
 
 ```bash
-.venv/bin/python reserve.py              # interactive: pick date, time, court
-.venv/bin/python reserve.py --auto       # auto-book best available slot
-.venv/bin/python reserve.py --dry-run    # show available slots, no booking
+.venv/bin/python reserve.py                            # interactive: pick date, time, court
+.venv/bin/python reserve.py --auto                     # auto-book best available slot
+.venv/bin/python reserve.py --dry-run                  # show available slots, no booking
+.venv/bin/python reserve.py --slot "2026-03-16 04:30"  # book a specific slot directly (24h format)
 ```
 
 ## Configuration
@@ -67,9 +68,11 @@ tail -f reserve.log
 
 ### Option 2: VPS with cron (~$4/month, most reliable)
 
+Any cheap VPS works (e.g. Hetzner CAX11 ~$4/mo). Cron fires within seconds of schedule.
+
 ```bash
-sudo timedatectl set-timezone America/New_York
-sudo apt install python3 python3-pip git -y
+timedatectl set-timezone America/New_York
+apt update && apt install -y python3 python3-pip git
 git clone https://github.com/mortimerliu/lifetime-reserve.git
 cd lifetime-reserve && pip3 install requests
 nano config.json   # paste your config
