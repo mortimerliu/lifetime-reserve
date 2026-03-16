@@ -292,18 +292,20 @@ def run_auto(session, token, sso_id, config):
     retry_delay = config.get("retry_delay_seconds", 10)
 
     today = date.today()
-
     member_ids = config.get("member_ids", [])
-    if member_ids:
-        reserved_dates = get_reserved_dates(
-            session, token, sso_id, member_ids,
-            today + timedelta(days=1),
-            today + timedelta(days=days_ahead),
-        )
-        log.info("Already reserved dates: %s", sorted(reserved_dates) or "none")
-    else:
-        reserved_dates = set()
-        log.warning("member_ids not in config — skipping reservation check")
+    reserved_dates = set()
+
+    def fetch_reserved_dates():
+        nonlocal reserved_dates
+        if member_ids:
+            reserved_dates = get_reserved_dates(
+                session, token, sso_id, member_ids,
+                today + timedelta(days=1),
+                today + timedelta(days=days_ahead - 1),
+            )
+            log.info("Already reserved dates: %s", sorted(reserved_dates) or "none")
+        else:
+            log.warning("member_ids not in config — skipping reservation check")
 
     def try_date(target_date):
         date_str = target_date.strftime("%Y-%m-%d")
@@ -346,6 +348,7 @@ def run_auto(session, token, sso_id, config):
     # Priority 2: scan days 1–7 once (no retry)
     log.info("No preferred slot on day %d after %d attempts — scanning days 1–%d ...",
              days_ahead, retry_count, days_ahead - 1)
+    fetch_reserved_dates()
     for i in range(1, days_ahead):
         if try_date(today + timedelta(days=i)):
             return

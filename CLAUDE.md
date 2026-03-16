@@ -27,9 +27,8 @@ Every API request requires the `ocp-apim-subscription-key` header (hardcoded) pl
 **Code structure** — four mode handler functions: `run_interactive`, `run_slot`, `run_auto`, `run_dry_run`. Shared helpers: `book_court` (create + complete), `collect_slots`, `auto_pick`, `pick_by_time`, `to_api_time`.
 
 **Auto booking logic** (`run_auto()`):
-1. Fetch existing reservations for days 1–8 once upfront
-2. Retry day 8 up to `retry_count` times with `retry_delay_seconds` between attempts (handles slots not yet released at exactly 9 AM)
-3. If day 8 fails all retries, scan days 1–7 once in order, skipping days with existing reservations
+1. Retry day 8 up to `retry_count` times with `retry_delay_seconds` between attempts (handles slots not yet released at exactly 9 AM) — no reservation check needed since day 8 is always a new date
+2. If day 8 fails all retries, fetch existing reservations for days 1–7, then scan in order skipping already-booked days
 4. `auto_pick()` selects by preferred time first, then preferred court order — returns `None` if no preferred time is available (never falls back to arbitrary slots)
 
 **Interactive mode** skips all retry/scan logic — user selects date and slot manually, confirms before booking.
