@@ -7,6 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 .venv/bin/python reserve.py                            # interactive: pick date, time, court
 .venv/bin/python reserve.py --auto                     # auto-book (used by scheduled job)
+.venv/bin/python reserve.py --auto --wait-until 09:00:00  # login early, book at 9AM sharp
 .venv/bin/python reserve.py --dry-run                  # show available slots, no booking
 .venv/bin/python reserve.py --slot "2026-03-16 04:30"  # book a specific slot directly (24h)
 ```
@@ -83,7 +84,7 @@ nano config.json   # paste your config
 
 crontab -e
 # Add:
-0 9 * * * cd /root/lifetime-reserve && python3 reserve.py --auto >> reserve.log 2>&1
+55 8 * * * cd /root/lifetime-reserve && python3 reserve.py --auto --wait-until 09:00:00 >> reserve.log 2>&1
 ```
 
 System timezone handles DST automatically.

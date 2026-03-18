@@ -413,6 +413,8 @@ def parse_args():
                        help="Show available slots without booking")
     group.add_argument("--slot", metavar="DATETIME",
                        help="Book a specific slot: 'YYYY-MM-DD HH:MM' (24h, e.g. '2026-03-16 04:30')")
+    parser.add_argument("--wait-until", metavar="HH:MM:SS",
+                        help="Login immediately, then wait until this time before booking (e.g. 09:00:00)")
     return parser.parse_args()
 
 
@@ -421,6 +423,21 @@ def main():
     config = load_config()
     session = make_session()
     token, sso_id = login(session, config["username"], config["password"])
+
+    if args.wait_until:
+        try:
+            target_time = datetime.strptime(args.wait_until, "%H:%M:%S").time()
+        except ValueError:
+            log.error("Invalid --wait-until format. Use HH:MM:SS (e.g. 09:00:00)")
+            sys.exit(1)
+        now = datetime.now()
+        target_dt = datetime.combine(now.date(), target_time)
+        wait_seconds = (target_dt - now).total_seconds()
+        if wait_seconds > 0:
+            log.info("Logged in early — waiting %.2fs until %s", wait_seconds, args.wait_until)
+            time.sleep(wait_seconds)
+        else:
+            log.warning("--wait-until time %s is in the past, proceeding immediately", args.wait_until)
 
     if args.slot:
         run_slot(session, token, sso_id, config, args.slot)
