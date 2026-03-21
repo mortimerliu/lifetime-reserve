@@ -82,6 +82,15 @@ nano config.json   # paste your config
 crontab -e
 # Add:
 55 8 * * * cd /root/lifetime-reserve && python3 reserve.py --auto --wait-until 09:00:00 >> reserve.log 2>&1
+
+# Verify it saved
+crontab -l
+
+# Check cron daemon is running
+systemctl status cron
+
+# Watch logs
+tail -f reserve.log
 ```
 
 ### Option 3: GitHub Actions (manual trigger only)
