@@ -25,12 +25,16 @@ Single-file script (`reserve.py`) with a flat function structure. All configurat
 
 Every API request requires the `ocp-apim-subscription-key` header (hardcoded) plus the two auth headers from login.
 
-**Code structure** — four mode handler functions: `run_interactive`, `run_slot`, `run_auto`, `run_dry_run`. Shared helpers: `book_court` (create + complete), `collect_slots`, `auto_pick`, `pick_by_time`, `to_api_time`.
+**Code structure** — four mode handler functions: `run_interactive`, `run_slot`, `run_auto`, `run_dry_run`. Shared helpers: `book_court` (create + complete), `collect_slots`, `auto_pick`, `pick_by_time`, `to_api_time`, `fmt_slots`, `validate_config`, `raise_for_status_with_body`.
 
 **Auto booking logic** (`run_auto()`):
-1. Retry day 8 up to `retry_count` times with `retry_delay_seconds` between attempts (handles slots not yet released at exactly 9 AM) — no reservation check needed since day 8 is always a new date
-2. If day 8 fails all retries, fetch existing reservations for days 1–7, then scan in order skipping already-booked days
-4. `auto_pick()` selects by preferred time first, then preferred court order — returns `None` if no preferred time is available (never falls back to arbitrary slots)
+1. Search day 8 **once** at 9 AM sharp, then retry **only the booking step** up to `retry_count` times:
+   - On 5xx (server overload): immediately retry booking the same slot — avoids releasing the slot between attempts
+   - On 4xx (slot taken): re-search once for another preferred slot, then continue retrying
+2. If day 8 yields no booking, fetch existing reservations for days 1–7, then scan in order skipping already-booked days. Each day is tried once; errors on individual days are caught and skipped rather than aborting the scan.
+3. `auto_pick()` selects by preferred time first, then preferred court order — returns `None` if no preferred time is available (never falls back to arbitrary slots)
+
+**Error handling**: `raise_for_status_with_body()` wraps `raise_for_status()` to include the API response body in exception messages. `/complete` failures are caught as warnings (booking stays pending) rather than raising, to prevent retry loops from double-booking.
 
 **Interactive mode** skips all retry/scan logic — user selects date and slot manually, confirms before booking.
 
@@ -88,6 +92,14 @@ crontab -e
 ```
 
 System timezone handles DST automatically.
+
+Log rotation is configured at `/etc/logrotate.d/lifetime-reserve` (daily, 30-day retention). Check VPS logs remotely using `check_vps_log.sh`:
+
+```bash
+./check_vps_log.sh          # last 50 lines (default)
+./check_vps_log.sh follow   # live stream
+./check_vps_log.sh all      # full log
+```
 
 ### Option 3: GitHub Actions (manual trigger only)
 
