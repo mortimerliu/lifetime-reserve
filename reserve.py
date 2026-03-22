@@ -118,6 +118,15 @@ def get_reserved_dates(session, token, sso_id, member_ids, start_date, end_date)
     return reserved
 
 
+def raise_for_status_with_body(resp):
+    """Like raise_for_status() but includes the response body in the exception message."""
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        body = resp.text[:500] if resp.text else "(empty)"
+        raise requests.HTTPError(f"{e} — body: {body}", response=resp) from None
+
+
 def book_court(session, token, sso_id, resource_id, start, duration):
     """Create a booking and immediately complete it (accept waiver)."""
     resp = session.post(
@@ -130,7 +139,7 @@ def book_court(session, token, sso_id, resource_id, start, duration):
         },
         headers={**auth_headers(token, sso_id), "content-type": "application/json"},
     )
-    resp.raise_for_status()
+    raise_for_status_with_body(resp)
     booking = resp.json()
 
     # Complete the booking (accept waiver) — moves from pending → completed
@@ -142,8 +151,14 @@ def book_court(session, token, sso_id, resource_id, start, duration):
             json={"acceptedDocuments": [int(agreement_id)]},
             headers={**auth_headers(token, sso_id), "content-type": "application/json"},
         )
-        complete_resp.raise_for_status()
-        booking["regStatus"] = "completed"
+        try:
+            raise_for_status_with_body(complete_resp)
+            booking["regStatus"] = "completed"
+        except requests.HTTPError as e:
+            # Booking exists but waiver confirmation failed — slot is ours (pending).
+            # Don't raise: returning here stops the retry loop from re-booking the same slot.
+            log.warning("Booking created (regId=%s) but /complete failed: %s", reg_id, e)
+            log.warning("Slot is pending — check your reservations page manually")
 
     return booking
 
@@ -342,6 +357,13 @@ def run_auto(session, token, sso_id, config):
         try:
             if try_date(day8):
                 return
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            log.error("Day %d attempt %d/%d failed: %s", days_ahead, attempt, retry_count, e)
+            if status is not None and status < 500:
+                # 4xx = slot gone or bad request — retrying the same slot won't help
+                log.info("Non-retriable %d error — skipping remaining day-%d retries", status, days_ahead)
+                break
         except Exception as e:
             log.error("Day %d attempt %d/%d failed: %s", days_ahead, attempt, retry_count, e)
 
@@ -420,6 +442,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    log.info("=" * 60)
+    log.info("Run started at %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     config = load_config()
     session = make_session()
     token, sso_id = login(session, config["username"], config["password"])
@@ -435,7 +459,18 @@ def main():
         wait_seconds = (target_dt - now).total_seconds()
         if wait_seconds > 0:
             log.info("Logged in early — waiting %.2fs until %s", wait_seconds, args.wait_until)
-            time.sleep(wait_seconds)
+            # Use monotonic clock for drift-free polling; datetime.now() only for initial gap.
+            mono_target = time.monotonic() + wait_seconds
+            while True:
+                remaining = mono_target - time.monotonic()
+                if remaining <= 0.020:
+                    break  # hand off to spin for final 20 ms
+                time.sleep(min(remaining - 0.020, 0.5))
+            # Spin for the last ~20 ms to avoid scheduler overshoot
+            while time.monotonic() < mono_target:
+                pass
+            log.info("Reached target time %s (overshoot: %.1f ms)",
+                     args.wait_until, (time.monotonic() - mono_target) * 1000)
         else:
             log.warning("--wait-until time %s is in the past, proceeding immediately", args.wait_until)
 
