@@ -10,7 +10,8 @@ Modes:
 
 Usage:
     .venv/bin/python reserve.py                              # interactive
-    .venv/bin/python reserve.py --auto                       # auto-book from preferred_times config
+    .venv/bin/python reserve.py --auto                       # auto-book day 8 only (default)
+    .venv/bin/python reserve.py --auto --fallback            # auto-book day 8, then scan days 1–7
     .venv/bin/python reserve.py --dry-run                    # show slots only
     .venv/bin/python reserve.py --slot "2026-03-16 04:30"   # book specific slot (24h)
 """
@@ -18,9 +19,11 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import requests
 
@@ -29,13 +32,21 @@ API_BASE = "https://api.lifetimefitness.com"
 APIM_KEY = "924c03ce573d473793e184219a6a19bd"
 ORIGIN = "https://my.lifetime.life"
 HTTP_TIMEOUT = (5, 10)  # (connect, read) in seconds
+LOG_DIR = Path(__file__).resolve().parent / "logs"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.StreamHandler()],
-)
+LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, handlers=[logging.StreamHandler()])
 log = logging.getLogger(__name__)
+
+
+def setup_file_logging():
+    """Add a FileHandler that writes to logs/YYYY-MM-DD.log (append mode)."""
+    LOG_DIR.mkdir(exist_ok=True)
+    log_file = LOG_DIR / f"{date.today().strftime('%Y-%m-%d')}.log"
+    fh = logging.FileHandler(log_file, mode="a")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter(LOG_FORMAT))
+    logging.getLogger().addHandler(fh)
 
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -316,7 +327,7 @@ def run_slot(session, token, sso_id, config, slot_datetime_str):
              booking["regId"], booking["regStatus"], booking.get("location", ""))
 
 
-def run_auto(session, token, sso_id, config):
+def run_auto(session, token, sso_id, config, fallback=False):
     club_id = config.get("club_id", "36")
     sport = config.get("sport", "Pickleball: Indoor")
     duration = config.get("duration", 60)
@@ -432,6 +443,11 @@ def run_auto(session, token, sso_id, config):
                 log.error("Day %d booking attempt %d/%d failed: %s",
                           days_ahead, attempt, retry_count, e)
 
+    if not fallback:
+        log.info("No booking on day %d — fallback scan disabled (use --fallback to scan days 1–%d)",
+                 days_ahead, days_ahead - 1)
+        return
+
     # Priority 2: scan days 1–7 once (no retry)
     log.info("No booking on day %d — scanning days 1–%d ...", days_ahead, days_ahead - 1)
     fetch_reserved_dates()
@@ -499,7 +515,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Lifetime Fitness Pickleball Court Reservation")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--auto", action="store_true",
-                       help="Auto-book best available slot from preferred_times config")
+                       help="Auto-book best available slot from preferred_times config (day 8 only by default)")
+    parser.add_argument("--fallback", action="store_true",
+                        help="With --auto: if day 8 has no preferred slot, also scan days 1–(N-1)")
     group.add_argument("--dry-run", action="store_true",
                        help="Show available slots without booking")
     group.add_argument("--slot", metavar="DATETIME",
@@ -510,6 +528,7 @@ def parse_args():
 
 
 def main():
+    setup_file_logging()
     args = parse_args()
     log.info("=" * 60)
     mode = "auto" if args.auto else "dry-run" if args.dry_run else f"slot({args.slot})" if args.slot else "interactive"
@@ -559,7 +578,7 @@ def main():
     if args.slot:
         run_slot(session, token, sso_id, config, args.slot)
     elif args.auto:
-        run_auto(session, token, sso_id, config)
+        run_auto(session, token, sso_id, config, fallback=args.fallback)
     elif args.dry_run:
         run_dry_run(session, token, sso_id, config)
     else:
