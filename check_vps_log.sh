@@ -1,22 +1,33 @@
 #!/bin/bash
 
 SSH="ssh -i ~/.ssh/hetzner_lifetime_reserve root@204.168.135.198"
+LOG_DIR="/root/lifetime-reserve/logs"
 
-case "${1:-tail}" in
-  tail)
-    $SSH "tail -50 /root/lifetime-reserve/reserve.log"
+case "${1:-today}" in
+  today)
+    $SSH "cat $LOG_DIR/\$(date +%Y-%m-%d).log 2>/dev/null || echo 'No log for today'"
     ;;
   follow)
-    $SSH "tail -f /root/lifetime-reserve/reserve.log"
+    $SSH "tail -f $LOG_DIR/\$(date +%Y-%m-%d).log"
     ;;
   all)
-    $SSH "cat /root/lifetime-reserve/reserve.log"
+    $SSH "cat $LOG_DIR/*.log"
+    ;;
+  ls)
+    $SSH "ls -lh $LOG_DIR/"
     ;;
   *)
-    echo "Usage: $0 [tail|follow|all]"
-    echo "  tail   - last 50 lines (default)"
-    echo "  follow - live stream"
-    echo "  all    - full log"
-    exit 1
+    # Treat as a date (YYYY-MM-DD)
+    if [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+      $SSH "cat $LOG_DIR/$1.log 2>/dev/null || echo 'No log for $1'"
+    else
+      echo "Usage: $0 [today|follow|all|ls|YYYY-MM-DD]"
+      echo "  today      - today's log (default)"
+      echo "  follow     - live stream today's log"
+      echo "  all        - all logs concatenated"
+      echo "  ls         - list log files"
+      echo "  YYYY-MM-DD - specific date's log"
+      exit 1
+    fi
     ;;
 esac

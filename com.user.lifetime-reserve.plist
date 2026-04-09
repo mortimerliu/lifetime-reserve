@@ -27,9 +27,9 @@
     </dict>
 
     <key>StandardOutPath</key>
-    <string>/Users/hongruliu/src/lifetime-reserve/reserve.log</string>
+    <string>/Users/hongruliu/src/lifetime-reserve/logs/launchd.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/hongruliu/src/lifetime-reserve/reserve.log</string>
+    <string>/Users/hongruliu/src/lifetime-reserve/logs/launchd.log</string>
 </dict>
 </plist>

@@ -5,11 +5,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Running the script
 
 ```bash
-.venv/bin/python reserve.py                            # interactive: pick date, time, court
-.venv/bin/python reserve.py --auto                     # auto-book (used by scheduled job)
-.venv/bin/python reserve.py --auto --wait-until 09:00:00  # login early, book at 9AM sharp
-.venv/bin/python reserve.py --dry-run                  # show available slots, no booking
-.venv/bin/python reserve.py --slot "2026-03-16 04:30"  # book a specific slot directly (24h)
+.venv/bin/python reserve.py                                    # interactive: pick date, time, court
+.venv/bin/python reserve.py --auto                             # auto-book day 8 only (default)
+.venv/bin/python reserve.py --auto --fallback                  # auto-book day 8, then scan days 1–7
+.venv/bin/python reserve.py --auto --wait-until 09:00:00       # login early, book at 9AM sharp
+.venv/bin/python reserve.py --dry-run                          # show available slots, no booking
+.venv/bin/python reserve.py --slot "2026-03-16 04:30"          # book a specific slot directly (24h)
 ```
 
 ## Architecture
@@ -31,7 +32,7 @@ Every API request requires the `ocp-apim-subscription-key` header (hardcoded) pl
 1. Search day 8 **once** at 9 AM sharp, then retry **only the booking step** up to `retry_count` times:
    - On 5xx (server overload): immediately retry booking the same slot — avoids releasing the slot between attempts
    - On 4xx (slot taken): re-search once for another preferred slot, then continue retrying
-2. If day 8 yields no booking, fetch existing reservations for days 1–7, then scan in order skipping already-booked days. Each day is tried once; errors on individual days are caught and skipped rather than aborting the scan.
+2. If day 8 yields no booking, exit by default. Pass `--fallback` to instead fetch existing reservations for days 1–(N-1) and scan in order, skipping already-booked days. Each day is tried once; errors on individual days are caught and skipped rather than aborting the scan.
 3. `auto_pick()` selects by preferred time first, then preferred court order — returns `None` if no preferred time is available (never falls back to arbitrary slots)
 
 **Error handling**: `raise_for_status_with_body()` wraps `raise_for_status()` to include the API response body in exception messages. `/complete` failures are caught as warnings (booking stays pending) rather than raising, to prevent retry loops from double-booking.
@@ -59,7 +60,7 @@ GitHub Actions cron has unpredictable queue delays (minutes) and is **not suitab
 
 ### Option 1: macOS launchd (current) — requires MacBook on and awake at 9 AM
 
-Plist installed at `~/Library/LaunchAgents/com.user.lifetime-reserve.plist`. Output goes to `reserve.log`.
+Plist installed at `~/Library/LaunchAgents/com.user.lifetime-reserve.plist`. Logs go to `logs/YYYY-MM-DD.log` (one file per day).
 
 ```bash
 # Install / reload after editing the plist
@@ -69,8 +70,8 @@ launchctl load ~/Library/LaunchAgents/com.user.lifetime-reserve.plist
 # Trigger manually
 launchctl start com.user.lifetime-reserve
 
-# Watch logs
-tail -f reserve.log
+# Watch today's log
+tail -f logs/$(date +%Y-%m-%d).log
 ```
 
 The plist points directly to `.venv/bin/python` — no activation needed.
@@ -88,17 +89,19 @@ nano config.json   # paste your config
 
 crontab -e
 # Add:
-55 8 * * * cd /root/lifetime-reserve && python3 reserve.py --auto --wait-until 09:00:00 >> reserve.log 2>&1
+55 8 * * * cd /root/lifetime-reserve && python3 reserve.py --auto --wait-until 09:00:00
 ```
 
 System timezone handles DST automatically.
 
-Log rotation is configured at `/etc/logrotate.d/lifetime-reserve` (daily, 30-day retention). Check VPS logs remotely using `check_vps_log.sh`:
+Daily log files in `logs/` are self-rotating (one file per day). Clean up old files with `find logs/ -mtime +30 -delete`. Check VPS logs remotely using `check_vps_log.sh`:
 
 ```bash
-./check_vps_log.sh          # last 50 lines (default)
-./check_vps_log.sh follow   # live stream
-./check_vps_log.sh all      # full log
+./check_vps_log.sh              # today's log (default)
+./check_vps_log.sh 2026-03-24   # specific date
+./check_vps_log.sh follow       # live stream today
+./check_vps_log.sh ls           # list log files
+./check_vps_log.sh all          # all logs concatenated
 ```
 
 ### Option 3: GitHub Actions (manual trigger only)

@@ -17,7 +17,8 @@ Copy `config.json` and fill in your credentials (see [Configuration](#configurat
 
 ```bash
 .venv/bin/python reserve.py                                        # interactive: pick date, time, court
-.venv/bin/python reserve.py --auto                                 # auto-book best available slot
+.venv/bin/python reserve.py --auto                                 # auto-book day 8 only (default)
+.venv/bin/python reserve.py --auto --fallback                      # auto-book day 8, then scan days 1–7
 .venv/bin/python reserve.py --auto --wait-until 09:00:00           # login early, book at 9 AM sharp
 .venv/bin/python reserve.py --dry-run                              # show available slots, no booking
 .venv/bin/python reserve.py --slot "2026-03-16 04:30"              # book a specific slot directly (24h format)
@@ -45,7 +46,7 @@ Edit `config.json`:
 In `--auto` mode:
 
 1. Tries to book day 8 (furthest out), retrying up to `retry_count` times with `retry_delay_seconds` between attempts — handles slots not yet released at exactly 9 AM.
-2. If day 8 fails all retries, fetches existing reservations for days 1–7 and scans in order, skipping already-booked days.
+2. If day 8 fails all retries, exits. Add `--fallback` to also scan days 1–(N-1) in order, skipping already-reserved dates.
 3. Picks the first slot matching `preferred_times` and `preferred_courts` order. Never falls back to non-preferred times.
 
 Use `--wait-until 09:00:00` to log in early (eliminating the ~5s login delay) and fire the first booking attempt right at 9 AM. Schedule the job at **8:55 AM** instead of 9 AM when using this flag.
