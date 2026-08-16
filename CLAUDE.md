@@ -38,7 +38,7 @@ reserve.py / server.py        # 2-line entry shims → lifetime_reserve.cli / .s
 lifetime_reserve/
 ├── config.py                 # typed frozen Config dataclass, load_config, ConfigError (defaults live here)
 ├── protocol.py               # <<<REPORT>>> markers (engine↔slackbot stdout contract)
-├── slots.py                  # PURE: collect_slots, auto_pick, pick_by_time, to_api_time, fmt_slots
+├── slots.py                  # PURE: collect_slots, rank_slots, auto_pick, pick_by_time, to_api_time, fmt_slots
 ├── reports.py                # PURE: build_*_report, emit_report
 ├── notify.py                 # Slack posting: post_message/update_message (explicit channel) + notify()
 ├── api/{errors,client}.py    # LifetimeClient — session + auth + all API endpoints
@@ -74,12 +74,12 @@ Every API request requires the `ocp-apim-subscription-key` header (hardcoded) pl
 
 **Auto booking logic** (`modes.run_auto()`):
 1. Search day 8 **once** at 9 AM sharp, then retry **only the booking step** up to `retry_count` times:
-   - On 5xx (server overload): immediately retry booking the same slot — avoids releasing the slot between attempts
-   - On 4xx (slot taken): re-search once for another preferred slot, then continue retrying
+   - On 5xx (server overload): retry booking the same slot — avoids releasing the slot between attempts — after waiting `retry_delay_seconds`
+   - On 4xx (slot lost): re-search, then take the next-best preferred slot **immediately, with no backoff** — the slot in hand is freshly searched and the 9 AM list drains within seconds, so sleeping here just hands it to someone else. A slot that returned 4xx is added to a `tried` set and never attempted again, so a stale search result can't send the loop back into the same failure
 2. If day 8 yields no booking, exit by default. Pass `--fallback` to instead fetch existing reservations for days 1–(N-1) and scan in order, skipping already-booked days. Each day is tried once; errors on individual days are caught and skipped rather than aborting the scan.
-3. `auto_pick()` selects by preferred time first, then preferred court order — returns `None` if no preferred time is available (never falls back to arbitrary slots)
+3. `rank_slots()` orders every slot at a preferred time (time preference first, then court preference); `auto_pick()` is its first element, or `None` when no preferred time is available (never falls back to arbitrary slots). `modes._book_best_available()` walks that ranking — up to `MAX_BOOKING_ATTEMPTS` — so one lost race doesn't sink the whole date. Used by `run_date`, `run_slot` (narrowed to the one requested time, all courts) and the `--fallback` scan.
 
-**Error handling**: `raise_for_status_with_body()` wraps `raise_for_status()` to include the API response body in exception messages. `/complete` failures are caught as warnings (booking stays pending) rather than raising, to prevent retry loops from double-booking.
+**Error handling**: `raise_for_status_with_body()` wraps `raise_for_status()` to include the API response body in exception messages. A rejected `/complete` raises `BookingIncompleteError` (a `requests.HTTPError` subclass carrying `reg_id`): the registration stays pending and is **not** a reservation, so callers must report failure and move to another slot. Returning the pending booking instead — as the code did until 2026-08-16 — made every caller report a booking that did not exist (three silently lost days: 08-02, 08-05, 08-16). Retrying after that rejection cannot double-book: **Lifetime allows one booking per profile per day** and rejects the second itself. Don't add a verification lookup to the recovery path — a single-date `get_reservations` costs ~600ms (vs ~340ms for the re-search), and slots drain within seconds of 9 AM.
 
 **Interactive mode** skips all retry/scan logic — user selects date and slot manually, confirms before booking.
 

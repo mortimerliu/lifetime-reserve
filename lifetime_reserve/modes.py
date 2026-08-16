@@ -16,9 +16,57 @@ import requests
 
 from lifetime_reserve.config import ConfigError
 from lifetime_reserve.slots import (
-    collect_slots, to_api_time, auto_pick, pick_by_time, fmt_slots)
+    collect_slots, to_api_time, auto_pick, pick_by_time, fmt_slots, rank_slots)
 
 log = logging.getLogger(__name__)
+
+# How many preferred slots to attempt on a single date before reporting failure.
+# Bounds the damage if every candidate is rejected for an account-level reason
+# (each rejected attempt leaves a pending registration behind).
+MAX_BOOKING_ATTEMPTS = 5
+
+
+def _slot_key(slot):
+    """Identity of a slot across re-searches (resourceId changes per search response)."""
+    return (slot["time"], slot.get("resourceName", ""))
+
+
+def _next_candidate(slots, preferred_times, preferred_courts, tried):
+    """Best preference-ranked slot we have not already failed on. None when exhausted."""
+    for candidate in rank_slots(slots, preferred_times, preferred_courts):
+        if _slot_key(candidate) not in tried:
+            return candidate
+    return None
+
+
+def _book_best_available(client, config, target_date, slots, preferred_times=None):
+    """Try preferred slots best-first until one is actually booked. Returns (slot, reason).
+
+    A lost race on the best slot no longer sinks the whole date — the next preferred
+    slot is attempted, up to MAX_BOOKING_ATTEMPTS. `reason` is None on success and
+    carries the last failure otherwise. `preferred_times` narrows the search to specific
+    times (a caller that asked for one exact time still gets every court at that time).
+    """
+    if preferred_times is None:
+        preferred_times = config.preferred_times
+    candidates = rank_slots(slots, preferred_times, config.preferred_courts)
+    if not candidates:
+        log.warning("No slots available at preferred times — skipping booking")
+        return None, "no preferred time available"
+
+    reason = None
+    for slot in candidates[:MAX_BOOKING_ATTEMPTS]:
+        log.info("Booking %s %s ...", slot["time"], slot["resourceName"])
+        try:
+            booking = client.book_court(slot["resourceId"], slot["start"], config.duration)
+        except Exception as e:
+            log.error("Booking failed: %s", e)
+            reason = f"booking failed: {e}"
+            continue
+        log.info("Confirmed: regId=%s, status=%s, location=%s",
+                 booking["regId"], booking["regStatus"], booking.get("location", ""))
+        return slot, None
+    return None, reason
 
 
 def fetch_upcoming(client, config):
@@ -136,15 +184,11 @@ def run_slot(client, config, slot_datetime_str):
         log.error("No slot available at %s. Available: %s", api_time, available)
         return dt, None, f"slot not available (options: {available})"
 
-    log.info("Booking %s %s ...", slot["time"], slot["resourceName"])
-    try:
-        booking = client.book_court(slot["resourceId"], slot["start"], duration)
-        log.info("Confirmed: regId=%s, status=%s, location=%s",
-                 booking["regId"], booking["regStatus"], booking.get("location", ""))
-        return dt, slot, None
-    except Exception as e:
-        log.error("Booking failed: %s", e)
-        return dt, None, f"booking failed: {e}"
+    # Every court at the requested time, in court-preference order — losing one court
+    # to a competitor should not fail the request while another court is still open.
+    booked, reason = _book_best_available(
+        client, config, target_date, slots, preferred_times=[api_time])
+    return dt, booked, reason
 
 
 def run_auto(client, config, fallback=False):
@@ -189,16 +233,10 @@ def run_auto(client, config, fallback=False):
 
         log.info("Available: %s", fmt_slots(slots))
 
-        slot = auto_pick(slots, preferred_times, preferred_courts)
-        if slot is None:
-            log.info("No preferred slot on %s", date_str)
-            return None
-
-        log.info("Booking %s %s ...", slot["time"], slot["resourceName"])
-        booking = client.book_court(slot["resourceId"], slot["start"], duration)
-        log.info("Confirmed: regId=%s, status=%s, location=%s",
-                 booking["regId"], booking["regStatus"], booking.get("location", ""))
-        return slot
+        booked, reason = _book_best_available(client, config, target_date, slots)
+        if booked is None:
+            log.info("No booking on %s — %s", date_str, reason)
+        return booked
 
     # Priority 1: day 8 — search once, then retry only the booking step
     # Retrying book (not search) on 5xx means we keep the slot locked across attempts
@@ -221,6 +259,7 @@ def run_auto(client, config, fallback=False):
 
     slot = None
     slot_picked_initially = False
+    tried = set()          # slots already lost — never re-picked after a re-search
     if day8_slots:
         log.info("Available: %s", fmt_slots(day8_slots))
         slot = auto_pick(day8_slots, preferred_times, preferred_courts)
@@ -235,11 +274,18 @@ def run_auto(client, config, fallback=False):
     booked_date = None
 
     if slot is not None:
+        # Back off only when the server told us to (5xx). After a 4xx we already hold a
+        # freshly-searched slot, and the 9 AM list drains in seconds — sleeping there
+        # just hands the slot to someone else.
+        backoff_before_retry = False
         for attempt in range(1, retry_count + 1):
-            if attempt > 1:
+            if attempt > 1 and backoff_before_retry:
                 log.info("Day %d booking retry %d/%d in %ds ...",
                          days_ahead, attempt, retry_count, retry_delay)
                 time.sleep(retry_delay)
+            elif attempt > 1:
+                log.info("Day %d booking retry %d/%d (no backoff — fresh slot) ...",
+                         days_ahead, attempt, retry_count)
             try:
                 log.info("Booking %s %s (attempt %d/%d) ...",
                          slot["time"], slot["resourceName"], attempt, retry_count)
@@ -254,24 +300,31 @@ def run_auto(client, config, fallback=False):
                 log.error("Day %d booking attempt %d/%d failed: %s",
                           days_ahead, attempt, retry_count, e)
                 if status is not None and status < 500:
-                    # 4xx: slot is gone — re-search for another preferred slot
-                    log.info("Slot taken — re-searching %s ...", day8_str)
+                    # 4xx: this slot is gone for good — never retry it, take the next best
+                    backoff_before_retry = False
+                    tried.add(_slot_key(slot))
+                    log.info("Slot lost — re-searching %s for another preferred slot ...", day8_str)
                     try:
                         result = client.search_courts(club_id, sport, day8, duration)
                         new_slots = collect_slots(result)
                         if new_slots:
                             log.info("Available: %s", fmt_slots(new_slots))
-                        slot = auto_pick(new_slots, preferred_times, preferred_courts) if new_slots else None
                     except Exception as search_e:
                         log.error("Re-search failed: %s", search_e)
-                        slot = None
+                        new_slots = []
+                    slot = _next_candidate(new_slots, preferred_times, preferred_courts, tried)
                     if slot is None:
-                        log.info("No preferred slot after re-search — done with day %d", days_ahead)
+                        log.info("No preferred slot left after re-search — done with day %d",
+                                 days_ahead)
                         break
-                # 5xx: keep same slot, retry booking
+                else:
+                    # 5xx (or no response at all): server trouble — keep the same slot
+                    # and give it a moment before trying again
+                    backoff_before_retry = True
             except Exception as e:
                 log.error("Day %d booking attempt %d/%d failed: %s",
                           days_ahead, attempt, retry_count, e)
+                backoff_before_retry = True
 
     if booked_slot is not None:
         return {"status": "booked", "target_date": booked_date, "booked_slot": booked_slot,
@@ -366,8 +419,6 @@ def run_date(client, config, date_str):
     club_id = config.club_id
     sport = config.sport
     duration = config.duration
-    preferred_times = config.preferred_times
-    preferred_courts = config.preferred_courts
 
     log.info("Searching %s ...", target_date.strftime("%A %Y-%m-%d"))
     try:
@@ -381,19 +432,10 @@ def run_date(client, config, date_str):
         log.info("No courts available on %s", date_str)
         return target_date, None, "no courts available", []
     log.info("Available: %s", fmt_slots(slots))
-    slot = auto_pick(slots, preferred_times, preferred_courts)
-    if slot is None:
-        log.info("No preferred slot on %s", date_str)
-        return target_date, None, "no preferred time available", slots
-    log.info("Booking %s %s ...", slot["time"], slot["resourceName"])
-    try:
-        booking = client.book_court(slot["resourceId"], slot["start"], duration)
-        log.info("Confirmed: regId=%s, status=%s, location=%s",
-                 booking["regId"], booking["regStatus"], booking.get("location", ""))
-        return target_date, slot, None, slots
-    except Exception as e:
-        log.error("Booking failed: %s", e)
-        return target_date, None, f"booking failed: {e}", slots
+    booked, reason = _book_best_available(client, config, target_date, slots)
+    if booked is None:
+        log.info("No booking on %s — %s", date_str, reason)
+    return target_date, booked, reason, slots
 
 
 def run_cancel(client, config, date_str):

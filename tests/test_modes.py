@@ -6,6 +6,7 @@ from datetime import date, timedelta
 import pytest
 import requests
 
+from lifetime_reserve.api.errors import BookingIncompleteError
 from lifetime_reserve.config import Config, ConfigError
 from lifetime_reserve import modes
 from lifetime_reserve.modes import run_auto, run_slot, run_date, run_cancel
@@ -55,17 +56,97 @@ def test_auto_5xx_retries_same_slot():
                             ("RA", "2026-08-10T07:00:00")]
 
 
+def test_auto_5xx_backs_off_before_retrying(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(modes.time, "sleep", lambda s: sleeps.append(s))
+    c = FakeClient(search_results=[search_envelope([make_slot("7:00 AM", "Court 3", "RA")])],
+                   book_results=[http_error(503), BOOKING])
+    res = run_auto(c, cfg(retry_delay_seconds=7))
+    assert res["status"] == "booked"
+    assert sleeps == [7]
+
+
+def test_auto_4xx_retries_immediately_without_backoff(monkeypatch):
+    """A fresh slot in hand must not wait — the 9 AM list drains in seconds."""
+    sleeps = []
+    monkeypatch.setattr(modes.time, "sleep", lambda s: sleeps.append(s))
+    c = FakeClient(
+        search_results=[search_envelope([make_slot("7:00 AM", "Court 3", "RA")]),
+                        search_envelope([make_slot("7:00 AM", "Court 2", "RB")])],
+        book_results=[http_error(409), BOOKING])
+    res = run_auto(c, cfg(preferred_courts=["Court 3", "Court 2"], retry_delay_seconds=7))
+    assert res["status"] == "booked"
+    assert sleeps == []
+
+
 # ── run_auto: 4xx re-searches and picks a NEW slot ───────────────────────────
 
 def test_auto_4xx_researches_new_slot():
     c = FakeClient(
         search_results=[search_envelope([make_slot("7:00 AM", "Court 3", "RA")]),
-                        search_envelope([make_slot("7:00 AM", "Court 3", "RB")])],
+                        search_envelope([make_slot("7:00 AM", "Court 2", "RB")])],
         book_results=[http_error(409), BOOKING])
-    res = run_auto(c, cfg())
+    res = run_auto(c, cfg(preferred_courts=["Court 3", "Court 2"]))
     assert res["status"] == "booked"
     assert len(c.search_calls) == 2                    # 4xx triggered a re-search
     assert [rid for rid, _ in c.book_calls] == ["RA", "RB"]
+
+
+def test_auto_4xx_never_retries_the_lost_slot():
+    """The re-search still lists the lost slot — pick the next one instead of looping on it."""
+    both = search_envelope([make_slot("7:00 AM", "Court 3", "RA"),
+                            make_slot("7:00 AM", "Court 2", "RB")])
+    c = FakeClient(search_results=[both, both],
+                   book_results=[http_error(409), BOOKING],
+                   )
+    res = run_auto(c, cfg(preferred_courts=["Court 3", "Court 2"], retry_count=3))
+    assert res["status"] == "booked"
+    assert res["booked_slot"]["resourceName"] == "Court 2"
+    assert [rid for rid, _ in c.book_calls] == ["RA", "RB"]
+
+
+# ── run_auto: a failed /complete is a failure, and the run keeps going ────────
+
+def incomplete_error(reg_id="REG1"):
+    return BookingIncompleteError("could not complete", reg_id=reg_id,
+                                  response=FakeResponse(status_code=400))
+
+
+def test_auto_incomplete_booking_falls_through_to_next_slot():
+    """Regression: a rejected /complete used to be reported as a successful booking."""
+    c = FakeClient(
+        search_results=[search_envelope([make_slot("7:00 AM", "Court 2", "RA")]),
+                        search_envelope([make_slot("7:00 AM", "Court 1", "RB")])],
+        book_results=[incomplete_error(), BOOKING])
+    res = run_auto(c, cfg(preferred_courts=["Court 2", "Court 1"]))
+    assert res["status"] == "booked"
+    assert res["booked_slot"]["resourceName"] == "Court 1"
+    assert [rid for rid, _ in c.book_calls] == ["RA", "RB"]
+
+
+def test_auto_incomplete_booking_with_no_alternative_is_not_booked():
+    c = FakeClient(
+        search_results=[search_envelope([make_slot("7:00 AM", "Court 2", "RA")]),
+                        search_envelope([])],
+        book_results=[incomplete_error()])
+    res = run_auto(c, cfg())
+    assert res["status"] == "booking_failed"
+    assert res["booked_slot"] is None
+
+
+def test_auto_recovery_makes_no_extra_reservation_lookup():
+    """The 9 AM recovery path stays lean: re-search and re-book, nothing else.
+
+    Lifetime allows one booking per profile per day, so it rejects a double-booking for
+    us — a verification lookup here would only add ~600ms while the slots drain.
+    """
+    c = FakeClient(
+        search_results=[search_envelope([make_slot("7:00 AM", "Court 2", "RA")]),
+                        search_envelope([make_slot("7:00 AM", "Court 1", "RB")])],
+        book_results=[incomplete_error(), BOOKING])
+    res = run_auto(c, cfg(preferred_courts=["Court 2", "Court 1"]))
+    assert res["status"] == "booked"
+    assert c.reservation_calls == []
 
 
 def test_auto_4xx_then_no_slot_is_booking_failed():
@@ -138,6 +219,34 @@ def test_run_slot_books_matching_time():
                    book_results=[BOOKING])
     dt, slot, reason = run_slot(c, cfg(), "2026-08-10 07:00")
     assert slot is not None and reason is None
+
+
+def test_run_slot_tries_other_courts_at_the_same_time():
+    c = FakeClient(
+        search_results=[search_envelope([make_slot("7:00 AM", "Court 3", "RA"),
+                                         make_slot("7:00 AM", "Court 1", "RB")])],
+        book_results=[incomplete_error(), BOOKING])
+    dt, slot, reason = run_slot(c, cfg(preferred_courts=["Court 3", "Court 1"]),
+                                "2026-08-10 07:00")
+    assert reason is None and slot["resourceName"] == "Court 1"
+
+
+def test_run_date_tries_next_preferred_time_before_failing():
+    c = FakeClient(
+        search_results=[search_envelope([make_slot("7:00 AM", "Court 3", "RA"),
+                                         make_slot("6:30 AM", "Court 3", "RB")])],
+        book_results=[incomplete_error(), BOOKING])
+    _, slot, reason, _ = run_date(c, cfg(preferred_times=["7:00 AM", "6:30 AM"]),
+                                  "2026-08-10")
+    assert reason is None and slot["time"] == "6:30 AM"
+
+
+def test_run_date_reports_failure_when_every_candidate_fails():
+    c = FakeClient(
+        search_results=[search_envelope([make_slot("7:00 AM", "Court 3", "RA")])],
+        book_results=[incomplete_error()])
+    _, slot, reason, _ = run_date(c, cfg(), "2026-08-10")
+    assert slot is None and "booking failed" in reason
 
 
 def test_run_slot_not_available():

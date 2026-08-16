@@ -11,6 +11,7 @@ import pytest
 import requests
 
 from lifetime_reserve.api.client import LifetimeClient
+from lifetime_reserve.api.errors import BookingIncompleteError
 from tests.conftest import FakeResponse, FakeSession
 
 
@@ -114,12 +115,15 @@ def test_book_court_complete_success():
     assert [m for m, _, _ in c.session.calls] == ["POST", "PUT"]
 
 
-def test_book_court_complete_failure_stays_pending_no_raise():
+def test_book_court_complete_failure_raises_booking_incomplete():
+    """A rejected /complete leaves no reservation — it must never look like a success."""
     c = make_client()
     c.session.queue("POST", FakeResponse(_booking()))
     c.session.queue("PUT", FakeResponse(status_code=400, text="waiver error"))
-    booking = c.book_court("RES1", "2026-08-10T07:00:00", 60)  # must NOT raise
-    assert booking["regStatus"] == "pending"
+    with pytest.raises(BookingIncompleteError) as excinfo:
+        c.book_court("RES1", "2026-08-10T07:00:00", 60)
+    assert excinfo.value.reg_id == "REG1"
+    assert excinfo.value.response.status_code == 400   # 4xx → callers move to another slot
 
 
 def test_book_court_skip_confirmation_no_complete_call():

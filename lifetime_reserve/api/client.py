@@ -10,7 +10,7 @@ from datetime import datetime
 
 import requests
 
-from lifetime_reserve.api.errors import raise_for_status_with_body
+from lifetime_reserve.api.errors import BookingIncompleteError, raise_for_status_with_body
 
 log = logging.getLogger(__name__)
 
@@ -139,7 +139,11 @@ class LifetimeClient:
     # ── booking / cancellation ───────────────────────────────────────────────
 
     def book_court(self, resource_id, start, duration):
-        """Create a booking and immediately complete it (accept waiver)."""
+        """Create a booking and immediately complete it (accept waiver).
+
+        Returns only when the slot is actually held: a booking that needs confirmation
+        but fails `/complete` raises `BookingIncompleteError`.
+        """
         resp = self.session.post(
             f"{API_BASE}/sys/registrations/V3/ux/resource",
             json={
@@ -168,10 +172,15 @@ class LifetimeClient:
                 raise_for_status_with_body(complete_resp)
                 booking["regStatus"] = "completed"
             except requests.HTTPError as e:
-                # Booking exists but waiver confirmation failed — slot is ours (pending).
-                # Don't raise: returning here stops the retry loop from re-booking the same slot.
+                # /complete is what actually claims the court — a rejection here means
+                # the registration stays pending and never becomes a reservation. Raise
+                # so callers report failure and move on to another slot; returning the
+                # pending booking made every caller report a success that did not exist.
                 log.warning("Booking created (regId=%s) but /complete failed: %s", reg_id, e)
-                log.warning("Slot is pending — check your reservations page manually")
+                log.warning("Registration %s stays pending — it is NOT a reservation", reg_id)
+                raise BookingIncompleteError(
+                    f"booking {reg_id} could not be completed: {e}",
+                    response=complete_resp, reg_id=reg_id) from None
 
         return booking
 

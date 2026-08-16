@@ -25,8 +25,12 @@ def to_api_time(hhmm_24h):
     return datetime.strptime(hhmm_24h, "%H:%M").strftime("%-I:%M %p")
 
 
-def auto_pick(slots, preferred_times, preferred_courts):
-    """Pick best slot by preferred time then preferred court. Returns None if no match."""
+def rank_slots(slots, preferred_times, preferred_courts):
+    """All slots at a preferred time, best first (time preference, then court preference).
+
+    Callers that lose a slot to a competitor walk this list for the next-best option
+    instead of giving up on the first failure.
+    """
     def court_rank(slot):
         name = slot.get("resourceName", "")
         try:
@@ -34,14 +38,20 @@ def auto_pick(slots, preferred_times, preferred_courts):
         except ValueError:
             return len(preferred_courts)
 
+    ranked = []
     for pref_time in preferred_times:
         candidates = [s for s in slots if s["time"] == pref_time]
-        if candidates:
-            candidates.sort(key=court_rank)
-            return candidates[0]
+        ranked.extend(sorted(candidates, key=court_rank))
+    return ranked
 
-    log.warning("No slots available at preferred times — skipping booking")
-    return None
+
+def auto_pick(slots, preferred_times, preferred_courts):
+    """Pick best slot by preferred time then preferred court. Returns None if no match."""
+    ranked = rank_slots(slots, preferred_times, preferred_courts)
+    if not ranked:
+        log.warning("No slots available at preferred times — skipping booking")
+        return None
+    return ranked[0]
 
 
 def pick_by_time(slots, api_time):

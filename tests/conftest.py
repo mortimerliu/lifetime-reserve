@@ -94,9 +94,10 @@ class FakeClient:
         self._book = list(book_results or [])
         self._reserved = reserved or (set(), [])
         self._reservations = reservations or []
-        self.search_calls = []   # target_date per call
-        self.book_calls = []     # (resource_id, start) per call
-        self.cancelled = []      # attendee_ids
+        self.search_calls = []        # target_date per call
+        self.book_calls = []          # (resource_id, start) per call
+        self.reservation_calls = []   # (start_date, end_date) per get_reservations call
+        self.cancelled = []           # attendee_ids
 
     @staticmethod
     def _next(queue, default):
@@ -119,6 +120,7 @@ class FakeClient:
         return self._reserved
 
     def get_reservations(self, member_ids, start_date, end_date):
+        self.reservation_calls.append((start_date, end_date))
         return self._reservations
 
     def cancel_attendee(self, attendee_id):
